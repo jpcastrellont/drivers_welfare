@@ -1,0 +1,3008 @@
+import warnings
+
+# Suppress all warnings
+warnings.filterwarnings("ignore")
+
+python_version = !python --version
+print(python_version)
+
+import numpy as np
+import pandas as pd
+
+import os
+import tempfile
+import base64
+from datetime import datetime
+
+import re
+from geopy.distance import geodesic
+from scipy.interpolate import interp1d
+import scipy.signal as signal
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
+import matplotlib.cm as cm
+
+import folium
+from folium.plugins import PolyLineTextPath
+
+
+!pip install datapane -q
+import datapane as dp
+
+# Function to load and process physiological data
+def load_process_data(file_path, value_column):
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return None
+    df = pd.read_csv(file_path)
+    df = df.dropna(subset=[value_column])
+    df['Time_empatica'] = pd.to_datetime(df['timestamp_iso']).dt.tz_localize(None)
+
+    # Drop columns that may cause duplicate conflicts
+    df = df.drop(columns=['timestamp_unix', 'timestamp_iso', 'participant_full_id', 'missing_value_reason'], errors='ignore')
+
+    return df
+
+# Function to load and process GPS data
+def load_gps_data(file_path):
+    if not os.path.exists(file_path):
+        print(f"GPS File not found: {file_path}")
+        return None
+    gps_df = pd.read_csv(file_path)
+    gps_df['Time'] = gps_df['Time'].apply(lambda x: datetime.strptime(x, "%b %d %I:%M%p %Z").replace(year=2024) if isinstance(x, str) else None)
+    return gps_df
+
+# Function to scale values between 5 and 15
+def scale_values(value, min_val, max_val):
+    return 5 + (value - min_val) / (max_val - min_val) * 10 if max_val > min_val else 5
+
+# ------------------------ Load and Preprocess Data ------------------------ #
+def preprocess_signal(signal_data):
+    """ Normalize and remove artifacts from the signal. """
+    if signal_data.isnull().all():
+        return np.nan  # Handle completely empty columns
+    return (signal_data - np.min(signal_data)) / (np.max(signal_data) - np.min(signal_data))
+
+# ------------------------ Feature Extraction for Stress scale ------------------------ #
+def extract_eda_features(eda_signal):
+    if eda_signal.isnull().all():
+        return 0, 0  # No EDA data available
+    peaks, _ = signal.find_peaks(eda_signal.dropna(), height=np.mean(eda_signal.dropna()) + np.std(eda_signal.dropna()))
+    return len(peaks), np.max(eda_signal.dropna()) - np.min(eda_signal.dropna())
+
+def bpm_to_rr_intervals(bpm_series):
+    """
+    Convert heart rate in bpm to R-R intervals in milliseconds.
+    """
+    rr_intervals = 60000 / bpm_series  # Convert BPM to RR intervals in ms
+    return rr_intervals
+
+def calculate_rmssd(rr_intervals):
+    """
+    Calculate Root Mean Square of Successive Differences (RMSSD).
+    """
+    diff_rr = np.diff(rr_intervals)
+    rmssd = np.sqrt(np.mean(diff_rr ** 2))
+    return rmssd
+
+def calculate_sdnn(rr_intervals):
+    """
+    Calculate Standard Deviation of NN intervals (SDNN).
+    """
+    return np.std(rr_intervals, ddof=1)  # ddof=1 for sample standard deviation
+
+def compute_hrv_score(bpm_series):
+    """
+    Compute heart rate variability score as the inverse of RMSSD and SDNN.
+    """
+    rr_intervals = bpm_to_rr_intervals(bpm_series)
+    rmssd = calculate_rmssd(rr_intervals)
+    sdnn = calculate_sdnn(rr_intervals)
+
+    # Avoid division by zero
+    hrv_score = 1 / (rmssd + 1e-6) + 1 / (sdnn + 1e-6)
+
+    return hrv_score
+
+def extract_temp_features(temp_signal):
+    if temp_signal.isnull().all():
+        return np.nan, np.nan
+    return np.mean(temp_signal.dropna()), np.min(temp_signal.dropna())
+
+def get_stress_color(stress_score):
+    if stress_score < 0.4:
+        return low_stress_color
+    elif stress_score < 0.7:
+        return medium_stress_color
+    else:
+        return high_stress_color
+
+#**HILLS PROSPECT: Driver**
+
+# Base directory and participant ID
+base_dir = "/content/drive/MyDrive/Stress data/Physiological Data"
+participant_id = "01-3YK32133V6"
+file_prefix = "1-1-01"
+
+# List of **specific** tracked dates
+tracked_dates = [
+    "2024-11-27",
+    "2024-11-28",
+    "2024-11-29",
+    "2024-12-06",
+    "2024-12-11"
+]
+
+# Collect all max/min values across days for scaling
+all_dataframes = []
+
+# Loop through tracked dates only
+for date in tracked_dates:
+    print(f"Processing data for {date}...")
+
+    # Format date for GPS file (YYMMDD)
+    gps_date_format = datetime.strptime(date, "%Y-%m-%d").strftime("%y%m%d")
+
+    # Define file paths
+    eda_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_eda.csv"
+    pulse_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_pulse-rate.csv"
+    temp_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_temperature.csv"
+    met_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_met.csv"
+    gps_file = f"/content/drive/MyDrive/Stress data/{gps_date_format}_Hills.csv"
+
+    # Load datasets
+    eda_df = load_process_data(eda_file, "eda_scl_usiemens")
+    pulse_df = load_process_data(pulse_file, "pulse_rate_bpm")
+    temp_df = load_process_data(temp_file, "temperature_celsius")
+    met_df = load_process_data(met_file, "met")
+    gps_df = load_gps_data(gps_file)
+
+    # Skip if EDA data is missing (core dataset)
+    if eda_df is None:
+        print(f"Skipping {date} due to missing EDA data.")
+        continue
+
+    # Merge physiological datasets
+    merged_df = eda_df
+    for df in [pulse_df, temp_df, met_df]:
+        if df is not None:
+            merged_df = merged_df.merge(df, on='Time_empatica', how='inner', suffixes=('', '_dup'))
+
+    # Drop duplicate columns
+    merged_df = merged_df.loc[:, ~merged_df.columns.str.endswith('_dup')]
+
+    # Merge with GPS data if available
+    if gps_df is not None:
+        merged_df = merged_df.merge(gps_df, left_on='Time_empatica', right_on='Time', how='left')
+        merged_df[['Latitude', 'Longitude']] = merged_df[['Latitude', 'Longitude']].ffill()
+        merged_df = merged_df.dropna(subset=['Latitude', 'Longitude'])
+
+        # Group by location
+        merged_df['location_group'] = (merged_df['Latitude'] != merged_df['Latitude'].shift()) | (merged_df['Longitude'] != merged_df['Longitude'].shift())
+        merged_df['location_group'] = merged_df['location_group'].cumsum()
+
+        # Compute max values per location
+        max_values = merged_df.groupby('location_group')[['temperature_celsius', 'pulse_rate_bpm', 'eda_scl_usiemens', 'met']].transform('max')
+        merged_df[['temperature_celsius_max', 'pulse_rate_bpm_max', 'eda_scl_usiemens_max', 'met_max']] = max_values
+
+    # Append to list for scaling
+    all_dataframes.append(merged_df)
+
+# Concatenate all data
+if all_dataframes:
+    all_data = pd.concat(all_dataframes, ignore_index=True)
+
+    # Compute global min/max for scaling
+    global_min_max = {
+        'temperature_celsius': (all_data['temperature_celsius_max'].min(), all_data['temperature_celsius_max'].max()),
+        'pulse_rate_bpm': (all_data['pulse_rate_bpm_max'].min(), all_data['pulse_rate_bpm_max'].max()),
+        'eda_scl_usiemens': (all_data['eda_scl_usiemens_max'].min(), all_data['eda_scl_usiemens_max'].max()),
+        'met': (all_data['met_max'].min(), all_data['met_max'].max())
+    }
+
+    # Apply scaling
+    all_data['scaled_radius_temp'] = all_data['temperature_celsius_max'].apply(lambda x: scale_values(x, *global_min_max['temperature_celsius']))
+    all_data['scaled_radius_HR'] = all_data['pulse_rate_bpm_max'].apply(lambda x: scale_values(x, *global_min_max['pulse_rate_bpm']))
+    all_data['scaled_radius_EDA'] = all_data['eda_scl_usiemens_max'].apply(lambda x: scale_values(x, *global_min_max['eda_scl_usiemens']))
+    all_data['scaled_radius_MET'] = all_data['met_max'].apply(lambda x: scale_values(x, *global_min_max['met']))
+
+    print("All tracked days successfully processed and scaled!")
+
+else:
+    print("No data processed.")
+
+
+# ------------------------ Processing signals ------------------------ #
+
+# Preprocess signals
+all_data["Filtered_EDA"] = preprocess_signal(all_data["eda_scl_usiemens"])
+all_data["Normalized_HR"] = preprocess_signal(all_data["pulse_rate_bpm"])
+all_data["Normalized_TEMP"] = preprocess_signal(all_data["temperature_celsius"])
+
+# Group data by 10-minute intervals
+all_data["TimeWindow"] = all_data["Time_empatica"].dt.floor('10T')  # Floor to nearest 10-minute interval
+all_data["Date"] = all_data["Time_empatica"].dt.date
+
+all_data["Stress_Score"] = np.nan
+all_data["EDA_Score"] = np.nan
+all_data["HRV_Score"] = np.nan
+all_data["TEMP_Score"] = np.nan
+
+for time_window, group in all_data.groupby("TimeWindow"):
+    eda_peak_count, eda_amplitude = extract_eda_features(group["Filtered_EDA"])
+    temp_mean, temp_drop = extract_temp_features(group["Normalized_TEMP"])
+
+    # Normalize features
+    eda_score = (eda_peak_count + eda_amplitude) / 2 if not np.isnan(eda_peak_count) else 0
+     # Ensure HRV values are valid before computations
+    hrv_score = compute_hrv_score(group['pulse_rate_bpm'])
+    temp_score = (1 / (temp_mean + 1) if not np.isnan(temp_mean) else 0) + \
+                 (1 / (abs(temp_drop) + 1) if not np.isnan(temp_drop) else 0)
+
+    # Define weights (adjustable)
+    w_eda, w_hrv, w_temp = 0.5, 0.3, 0.2
+
+    # Compute daily stress score
+    stress_score = w_eda * eda_score + w_hrv * hrv_score + w_temp * temp_score
+
+    # Assign stress score to all data points in the same time window
+    all_data.loc[all_data["TimeWindow"] == time_window, "Stress_Score"] = stress_score
+    all_data.loc[all_data["TimeWindow"] == time_window, "EDA_Score"] = eda_score
+    all_data.loc[all_data["TimeWindow"] == time_window, "HRV_Score"] = hrv_score
+    all_data.loc[all_data["TimeWindow"] == time_window, "TEMP_Score"] = temp_score
+
+# ------------------------ Generate Plots Per Day ------------------------ #
+unique_dates = all_data["Date"].unique()
+
+# Define three distinct colors from the 'jet' colormap for the three stress levels
+
+low_stress_color = cm.jet(0.2)  # Color for stress scores 0.2 - 0.4
+medium_stress_color = cm.jet(0.55)  # Color for stress scores 0.4 - 0.7
+high_stress_color = cm.jet(0.8)  # Color for stress scores > 0.7
+
+for date in unique_dates:
+    daily_data = all_data[all_data["Date"] == date]
+
+    colors = colors = [
+    high_stress_color if score > 0.7 else
+    medium_stress_color if score >= 0.4 else
+    low_stress_color
+    for score in daily_data["Stress_Score"]]
+
+    plt.figure(figsize=(12, 5))
+    plt.bar(daily_data["TimeWindow"], daily_data["Stress_Score"], color=colors, width=0.006)
+    plt.xlabel("Time")
+    plt.ylabel("Stress Score")
+    plt.title(f"10-Minute-Based Stress Score on {date}")
+    plt.xticks(rotation=45)
+    plt.ylim(0, 1)
+
+   # Use proper date formatting for x-axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Show only hours & minutes
+    plt.gca().xaxis.set_major_locator(mdates.HourLocator(interval=1))  # Show labels every hour
+
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+
+
+    legend_patches = [
+    mpatches.Patch(color=low_stress_color, label="Low Stress (<0.4)"),
+    mpatches.Patch(color=medium_stress_color, label="Medium Stress (0.4 - 0.7)"),
+    mpatches.Patch(color=high_stress_color, label="High Stress (>0.7)")
+    ]
+    plt.legend(handles=legend_patches, loc="upper right")
+    plt.show()
+
+
+all_data['scaled_Stress_Score'] = all_data['Stress_Score'].apply(lambda x: scale_values(x,all_data['Stress_Score'].min(),all_data['Stress_Score'].max()))
+cmap = plt.get_cmap('jet')  # Change colormap if needed
+
+# Get unique dates from the dataset
+all_data['date'] = all_data['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-11-27 07:38:00"),
+    pd.Timestamp("2024-11-27 09:11:00"),
+
+    pd.Timestamp("2024-11-28 07:30:00"),
+    pd.Timestamp("2024-11-28 08:40:00"),
+
+    pd.Timestamp("2024-11-29 07:30:00"),
+    pd.Timestamp("2024-11-29 11:45:00"),
+
+    pd.Timestamp("2024-12-03 07:30:00"),
+    pd.Timestamp("2024-12-03 08:30:00"),
+
+    pd.Timestamp("2024-12-04 07:45:00"),
+    pd.Timestamp("2024-12-04 08:30:00"),
+
+    pd.Timestamp("2024-12-06 07:30:00"),
+    pd.Timestamp("2024-12-06 09:05:00"),
+
+    pd.Timestamp("2024-12-10 07:20:00"),
+    pd.Timestamp("2024-12-10 09:15:00"),
+
+    pd.Timestamp("2024-12-11 07:40:00"),
+    pd.Timestamp("2024-12-11 08:45:00"),
+
+    pd.Timestamp("2024-12-13 07:20:00"),
+    pd.Timestamp("2024-12-13 11:30:00")
+]
+
+# Store maps and corresponding media components
+datapane_html_maps = []
+
+for date in unique_dates:
+    daily_data = all_data[all_data['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+   # for i in range(len(daily_data) - 1):
+    #    start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+     #   end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+      #  temp = daily_data.iloc[i]['temperature_celsius_max']
+
+        # Get color from temperature
+       # color = mcolors.to_hex(cmap(norm(temp)))
+
+        #folium.PolyLine([start, end], color=color, weight=8, opacity=0.9).add_to(m)
+
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+
+        low_stress_color = mcolors.to_hex(cm.jet(0.2))  # Color for stress scores 0.2 - 0.4
+        medium_stress_color = mcolors.to_hex(cm.jet(0.55))  # Color for stress scores 0.4 - 0.7
+        high_stress_color = mcolors.to_hex(cm.jet(0.8))  # Color for stress scores > 0.7
+
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "red"   # Highlight color (changeable)
+            weight = 4
+        else:
+            color=None
+            weight =None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_Stress_Score'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=get_stress_color(row['Stress_Score']),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Stress Score:</b> {row['Stress_Score']:.3f}<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Stress score: {row['Stress_Score']:.3f}"
+        ).add_to(m)
+
+    # **Add color legend as a HTML overlay**
+    min_stress = all_data['Stress_Score'].min()
+    max_stress = all_data['Stress_Score'].max()
+    legend_html = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Stress score </b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{low_stress_color}" />
+                    <stop offset="33%" stop-color="{low_stress_color}" />
+                    <stop offset="34%" stop-color="{medium_stress_color}" />
+                    <stop offset="66%" stop-color="{medium_stress_color}" />
+                    <stop offset="67%" stop-color="{high_stress_color}" />
+                    <stop offset="100%" stop-color="{high_stress_color}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Stress Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_stress:.1f}</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.25):.1f}</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.4):.1f}</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.6):.1f}</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_stress:.1f}</text>
+        </svg>
+    </div>
+"""
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file:
+        m.save(temp_file.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file.name, "rb") as f:
+            encoded_html = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html = f"""
+        <iframe src="data:text/html;base64,{encoded_html}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title = dp.Text(f"### Stress Map - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps.append(title)
+        datapane_html_maps.append(dp.HTML(iframe_html, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file.name)
+
+# **Create a Datapane Report**
+report1 = dp.Report(
+    dp.Text("# GPS data with Stress levels coloring - Hills Driver"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report1.save("gps_stress_dashboard_Hills_driver.html")  # Save locally
+# report.upload(name="GPS Stress Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_stress_dashboard_Hills_driver.html' to view it.")
+
+# Normalize temperature for color mapping
+norm_temp = plt.Normalize(all_data['temperature_celsius'].min(), all_data['temperature_celsius'].max())
+norm_pulse = plt.Normalize(all_data['pulse_rate_bpm'].min(), all_data['pulse_rate_bpm'].max())
+norm_eda = plt.Normalize(all_data['eda_scl_usiemens'].min(), all_data['eda_scl_usiemens'].max())
+
+cmap_temp = plt.get_cmap('jet')  # Change colormap if needed
+cmap_pulse = plt.get_cmap('jet')  # You can change this colormap if you prefer
+cmap_eda = plt.get_cmap('jet')  # Another colormap choice
+
+# Get unique dates from the dataset
+all_data['date'] = all_data['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-11-27 07:38:00"),
+    pd.Timestamp("2024-11-27 09:11:00"),
+
+    pd.Timestamp("2024-11-28 07:30:00"),
+    pd.Timestamp("2024-11-28 08:40:00"),
+
+    pd.Timestamp("2024-11-29 07:30:00"),
+    pd.Timestamp("2024-11-29 11:45:00"),
+
+    pd.Timestamp("2024-12-03 07:30:00"),
+    pd.Timestamp("2024-12-03 08:30:00"),
+
+    pd.Timestamp("2024-12-04 07:45:00"),
+    pd.Timestamp("2024-12-04 08:30:00"),
+
+    pd.Timestamp("2024-12-06 07:30:00"),
+    pd.Timestamp("2024-12-06 09:05:00"),
+
+    pd.Timestamp("2024-12-10 07:20:00"),
+    pd.Timestamp("2024-12-10 09:15:00"),
+
+    pd.Timestamp("2024-12-11 07:40:00"),
+    pd.Timestamp("2024-12-11 08:45:00"),
+
+    pd.Timestamp("2024-12-13 07:20:00"),
+    pd.Timestamp("2024-12-13 11:30:00")
+]
+
+
+# Store maps and corresponding media components
+datapane_html_maps = []
+
+for date in unique_dates:
+    daily_data = all_data[all_data['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m_temp = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_pulse = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_eda = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+   # for i in range(len(daily_data) - 1):
+    #    start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+     #   end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+
+      #  temp = daily_data.iloc[i]['temperature_celsius_max']
+       # pulse = daily_data.iloc[i]['pulse_rate_bpm_max']
+        #eda = daily_data.iloc[i]['eda_scl_usiemens_max']
+
+        # Get color from temperature
+        #color_temp = mcolors.to_hex(cmap_temp(norm_temp(temp)))
+        #color_pulse = mcolors.to_hex(cmap_pulse(norm_pulse(pulse)))
+        #color_eda = mcolors.to_hex(cmap_eda(norm_eda(eda)))
+
+        #folium.PolyLine([start, end], color=color_temp, weight=8, opacity=0.9).add_to(m_temp)
+        #folium.PolyLine([start, end], color=color_pulse, weight=6, opacity=0.9).add_to(m_pulse)
+        #folium.PolyLine([start, end], color=color_eda, weight=6, opacity=0.9).add_to(m_eda)
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "black"   # Highlight color (changeable)
+            weight = 4
+        else:
+            color=None
+            weight =None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_temp'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_temp(norm_temp(row['temperature_celsius_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Temp:</b> {row['temperature_celsius_max']}°C<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Temp: {row['temperature_celsius_max']}°C"
+        ).add_to(m_temp)
+
+        folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=row['scaled_radius_HR'],  # Fixed radius
+                    color=color,
+                    weight = weight,
+                    fill=True,
+                    fill_color=mcolors.to_hex(cmap_pulse(norm_pulse(row['pulse_rate_bpm_max']))),
+                    fill_opacity=0.8,
+                    popup=(
+                        f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"<b>Pulse:</b> {row['pulse_rate_bpm_max']}bpm<br>"
+                    ),
+                    tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Pulse: {row['pulse_rate_bpm_max']}bpm"
+                ).add_to(m_pulse)
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_EDA'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_eda(norm_eda(row['eda_scl_usiemens_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>EDA:</b> {row['eda_scl_usiemens_max']}µS<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | EDA: {row['eda_scl_usiemens_max']}µS"
+        ).add_to(m_eda)
+
+    # **Add color legend as a HTML overlay**
+    min_temp = all_data['temperature_celsius'].min()
+    max_temp = all_data['temperature_celsius'].max()
+    legend_html_temp = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Temperature (°C)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(max_temp)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Temperature Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_temp:.1f}°C</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.25):.1f}°C</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.5):.1f}°C</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.75):.1f}°C</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_temp:.1f}°C</text>
+        </svg>
+    </div>
+"""
+
+    min_pulse = all_data['pulse_rate_bpm'].min()
+    max_pulse = all_data['pulse_rate_bpm'].max()
+    legend_html_pulse = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Pulse (bpm)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(max_pulse)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Pulse Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_pulse:.1f}bpm</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.25):.1f}bpm</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.5):.1f}bpm</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.75):.1f}bpm</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_pulse:.1f}bpm</text>
+        </svg>
+    </div>
+"""
+
+    min_eda = all_data['eda_scl_usiemens'].min()
+    max_eda = all_data['eda_scl_usiemens'].max()
+    legend_html_eda = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>EDA (µS)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(max_eda)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- EDA Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_eda:.1f}µS</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.25):.1f}µS</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.5):.1f}µS</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.75):.1f}µS</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_eda:.1f}µS</text>
+        </svg>
+    </div>
+"""
+
+    m_temp.get_root().html.add_child(folium.Element(legend_html_temp))
+    m_pulse.get_root().html.add_child(folium.Element(legend_html_pulse))
+    m_eda.get_root().html.add_child(folium.Element(legend_html_eda))
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_temp:
+        m_temp.save(temp_file_temp.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_temp.name, "rb") as f:
+            encoded_html_temp = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_temp = f"""
+        <iframe src="data:text/html;base64,{encoded_html_temp}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_temp = dp.Text(f"### GPS Trajectory and Temperature - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps.append(title_temp)
+        datapane_html_maps.append(dp.HTML(iframe_html_temp, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_temp.name)
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_pulse:
+        m_pulse.save(temp_file_pulse.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_pulse.name, "rb") as f:
+            encoded_html_pulse = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_pulse = f"""
+        <iframe src="data:text/html;base64,{encoded_html_pulse}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_pulse = dp.Text(f"### GPS Trajectory and Heart Rate - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps.append(title_pulse)
+        datapane_html_maps.append(dp.HTML(iframe_html_pulse, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_pulse.name)
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_eda:
+        m_eda.save(temp_file_eda.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_eda.name, "rb") as f:
+            encoded_html_eda = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_eda = f"""
+        <iframe src="data:text/html;base64,{encoded_html_eda}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_eda = dp.Text(f"### GPS Trajectory and EDA - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps.append(title_eda)
+        datapane_html_maps.append(dp.HTML(iframe_html_eda, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_eda.name)
+
+
+# **Create a Datapane Report**
+report = dp.Report(
+    dp.Text("# GPS Trajectory Maps with Biometrics Coloring - Hills Driver"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report.save("gps_biometrics_dashboard_Hills_driver.html")  # Save locally
+# report.upload(name="GPS Temperature Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_biometrics_dashboard_Hills_driver.html' to view it.")
+
+#**HILLS PROSPECT: Copilot**
+
+# Base directory and participant ID
+base_dir = "/content/drive/MyDrive/Stress data/Physiological Data"
+participant_id = "02-3YK33141TN"
+file_prefix = "1-1-02"
+
+# List of **specific** tracked dates
+tracked_dates = [
+    "2024-11-27",
+    "2024-11-28",
+    "2024-11-29",
+    "2024-12-03",
+    "2024-12-04",
+    "2024-12-06",
+    "2024-12-10",
+    "2024-12-11",
+    "2024-12-13"
+]
+
+# Collect all max/min values across days for scaling
+all_dataframes2 = []
+
+# Loop through tracked dates only
+for date in tracked_dates:
+    print(f"Processing data for {date}...")
+
+    # Format date for GPS file (YYMMDD)
+    gps_date_format = datetime.strptime(date, "%Y-%m-%d").strftime("%y%m%d")
+
+    # Define file paths
+    eda_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_eda.csv"
+    pulse_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_pulse-rate.csv"
+    temp_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_temperature.csv"
+    met_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_met.csv"
+    gps_file = f"/content/drive/MyDrive/Stress data/{gps_date_format}_Hills.csv"
+
+    # Load datasets
+    eda_df = load_process_data(eda_file, "eda_scl_usiemens")
+    pulse_df = load_process_data(pulse_file, "pulse_rate_bpm")
+    temp_df = load_process_data(temp_file, "temperature_celsius")
+    met_df = load_process_data(met_file, "met")
+    gps_df = load_gps_data(gps_file)
+
+    # Skip if EDA data is missing (core dataset)
+    if eda_df is None:
+        print(f"Skipping {date} due to missing EDA data.")
+        continue
+
+    # Merge physiological datasets
+    merged_df = eda_df
+    for df in [pulse_df, temp_df, met_df]:
+        if df is not None:
+            merged_df = merged_df.merge(df, on='Time_empatica', how='inner', suffixes=('', '_dup'))
+
+    # Drop duplicate columns
+    merged_df = merged_df.loc[:, ~merged_df.columns.str.endswith('_dup')]
+
+    # Merge with GPS data if available
+    if gps_df is not None:
+        merged_df = merged_df.merge(gps_df, left_on='Time_empatica', right_on='Time', how='left')
+        merged_df[['Latitude', 'Longitude']] = merged_df[['Latitude', 'Longitude']].ffill()
+        merged_df = merged_df.dropna(subset=['Latitude', 'Longitude'])
+
+        # Group by location
+        merged_df['location_group'] = (merged_df['Latitude'] != merged_df['Latitude'].shift()) | (merged_df['Longitude'] != merged_df['Longitude'].shift())
+        merged_df['location_group'] = merged_df['location_group'].cumsum()
+
+        # Compute max values per location
+        max_values = merged_df.groupby('location_group')[['temperature_celsius', 'pulse_rate_bpm', 'eda_scl_usiemens', 'met']].transform('max')
+        merged_df[['temperature_celsius_max', 'pulse_rate_bpm_max', 'eda_scl_usiemens_max', 'met_max']] = max_values
+
+    # Append to list for scaling
+    all_dataframes2.append(merged_df)
+
+# Concatenate all data
+if all_dataframes2:
+    all_data2 = pd.concat(all_dataframes2, ignore_index=True)
+
+    # Compute global min/max for scaling
+    global_min_max = {
+        'temperature_celsius': (all_data2['temperature_celsius_max'].min(), all_data2['temperature_celsius_max'].max()),
+        'pulse_rate_bpm': (all_data2['pulse_rate_bpm_max'].min(), all_data2['pulse_rate_bpm_max'].max()),
+        'eda_scl_usiemens': (all_data2['eda_scl_usiemens_max'].min(), all_data2['eda_scl_usiemens_max'].max()),
+        'met': (all_data2['met_max'].min(), all_data2['met_max'].max())
+    }
+
+    # Function to scale values between 5 and 15
+    def scale_values(value, min_val, max_val):
+        return 5 + (value - min_val) / (max_val - min_val) * 10 if max_val > min_val else 5
+
+    # Apply scaling
+    all_data2['scaled_radius_temp'] = all_data2['temperature_celsius_max'].apply(lambda x: scale_values(x, *global_min_max['temperature_celsius']))
+    all_data2['scaled_radius_HR'] = all_data2['pulse_rate_bpm_max'].apply(lambda x: scale_values(x, *global_min_max['pulse_rate_bpm']))
+    all_data2['scaled_radius_EDA'] = all_data2['eda_scl_usiemens_max'].apply(lambda x: scale_values(x, *global_min_max['eda_scl_usiemens']))
+    all_data2['scaled_radius_MET'] = all_data2['met_max'].apply(lambda x: scale_values(x, *global_min_max['met']))
+
+    print("All tracked days successfully processed and scaled!")
+
+else:
+    print("No data processed.")
+
+
+# ------------------------ Processing signals ------------------------ #
+
+# Preprocess signals
+all_data2["Filtered_EDA"] = preprocess_signal(all_data2["eda_scl_usiemens"])
+all_data2["Normalized_HR"] = preprocess_signal(all_data2["pulse_rate_bpm"])
+all_data2["Normalized_TEMP"] = preprocess_signal(all_data2["temperature_celsius"])
+
+# Group data by 10-minute intervals
+all_data2["TimeWindow"] = all_data2["Time_empatica"].dt.floor('10T')  # Floor to nearest 10-minute interval
+all_data2["Date"] = all_data2["Time_empatica"].dt.date
+
+all_data2["Stress_Score"] = np.nan
+all_data2["EDA_Score"] = np.nan
+all_data2["HRV_Score"] = np.nan
+all_data2["TEMP_Score"] = np.nan
+
+for time_window, group in all_data2.groupby("TimeWindow"):
+    eda_peak_count, eda_amplitude = extract_eda_features(group["Filtered_EDA"])
+    temp_mean, temp_drop = extract_temp_features(group["Normalized_TEMP"])
+
+    # Normalize features
+    eda_score = (eda_peak_count + eda_amplitude) / 2 if not np.isnan(eda_peak_count) else 0
+     # Ensure HRV values are valid before computations
+    hrv_score = compute_hrv_score(group['pulse_rate_bpm'])
+    temp_score = (1 / (temp_mean + 1) if not np.isnan(temp_mean) else 0) + \
+                 (1 / (abs(temp_drop) + 1) if not np.isnan(temp_drop) else 0)
+
+    # Define weights (adjustable)
+    w_eda, w_hrv, w_temp = 0.5, 0.3, 0.2
+
+    # Compute daily stress score
+    stress_score = w_eda * eda_score + w_hrv * hrv_score + w_temp * temp_score
+
+    # Assign stress score to all data points in the same time window
+    all_data2.loc[all_data2["TimeWindow"] == time_window, "Stress_Score"] = stress_score
+    all_data2.loc[all_data2["TimeWindow"] == time_window, "EDA_Score"] = eda_score
+    all_data2.loc[all_data2["TimeWindow"] == time_window, "HRV_Score"] = hrv_score
+    all_data2.loc[all_data2["TimeWindow"] == time_window, "TEMP_Score"] = temp_score
+
+all_data2 = all_data2[~(all_data2['Stress_Score'] > 1)]
+
+# ------------------------ Generate Plots Per Day ------------------------ #
+unique_dates = all_data2["Date"].unique()
+
+# Define three distinct colors from the 'jet' colormap for the three stress levels
+
+low_stress_color = cm.jet(0.2)  # Color for stress scores 0.2 - 0.4
+medium_stress_color = cm.jet(0.55)  # Color for stress scores 0.4 - 0.7
+high_stress_color = cm.jet(0.8)  # Color for stress scores > 0.7
+
+for date in unique_dates:
+    daily_data = all_data2[all_data2["Date"] == date]
+
+    colors = colors = [
+    high_stress_color if score > 0.7 else
+    medium_stress_color if score >= 0.4 else
+    low_stress_color
+    for score in daily_data["Stress_Score"]]
+
+    plt.figure(figsize=(12, 5))
+    plt.bar(daily_data["TimeWindow"], daily_data["Stress_Score"], color=colors, width=0.006)
+    plt.xlabel("Time")
+    plt.ylabel("Stress Score")
+    plt.title(f"10-Minute-Based Stress Score on {date}")
+    plt.xticks(rotation=45)
+    plt.ylim(0, 1)
+
+   # Use proper date formatting for x-axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Show only hours & minutes
+    plt.gca().xaxis.set_major_locator(mdates.HourLocator(interval=1))  # Show labels every hour
+
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+
+
+    legend_patches = [
+    mpatches.Patch(color=low_stress_color, label="Low Stress (<0.4)"),
+    mpatches.Patch(color=medium_stress_color, label="Medium Stress (0.4 - 0.7)"),
+    mpatches.Patch(color=high_stress_color, label="High Stress (>0.7)")
+    ]
+    plt.legend(handles=legend_patches, loc="upper right")
+    plt.show()
+
+
+all_data2['scaled_Stress_Score'] = all_data2['Stress_Score'].apply(lambda x: scale_values(x,all_data2['Stress_Score'].min(),all_data2['Stress_Score'].max()))
+cmap = plt.get_cmap('jet')  # Change colormap if needed
+
+# Get unique dates from the dataset
+all_data2['date'] = all_data2['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data2['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-11-27 07:38:00"),
+    pd.Timestamp("2024-11-27 09:11:00"),
+
+    pd.Timestamp("2024-11-28 07:30:00"),
+    pd.Timestamp("2024-11-28 08:40:00"),
+
+    pd.Timestamp("2024-11-29 07:30:00"),
+    pd.Timestamp("2024-11-29 11:45:00"),
+
+    pd.Timestamp("2024-12-03 07:30:00"),
+    pd.Timestamp("2024-12-03 08:30:00"),
+
+    pd.Timestamp("2024-12-04 07:45:00"),
+    pd.Timestamp("2024-12-04 08:30:00"),
+
+    pd.Timestamp("2024-12-06 07:30:00"),
+    pd.Timestamp("2024-12-06 09:05:00"),
+
+    pd.Timestamp("2024-12-10 07:20:00"),
+    pd.Timestamp("2024-12-10 09:15:00"),
+
+    pd.Timestamp("2024-12-11 07:40:00"),
+    pd.Timestamp("2024-12-11 08:45:00"),
+
+    pd.Timestamp("2024-12-13 07:20:00"),
+    pd.Timestamp("2024-12-13 11:30:00")
+]
+
+
+# Store maps and corresponding media components
+datapane_html_maps2 = []
+
+for date in unique_dates:
+    daily_data = all_data2[all_data2['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+   # for i in range(len(daily_data) - 1):
+    #    start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+     #   end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+      #  temp = daily_data.iloc[i]['temperature_celsius_max']
+
+        # Get color from temperature
+       # color = mcolors.to_hex(cmap(norm(temp)))
+
+        #folium.PolyLine([start, end], color=color, weight=8, opacity=0.9).add_to(m)
+
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+
+        low_stress_color = mcolors.to_hex(cm.jet(0.2))  # Color for stress scores 0.2 - 0.4
+        medium_stress_color = mcolors.to_hex(cm.jet(0.55))  # Color for stress scores 0.4 - 0.7
+        high_stress_color = mcolors.to_hex(cm.jet(0.8))  # Color for stress scores > 0.7
+
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "red"   # Highlight color (changeable)
+            weight = 4
+        else:
+            color=None
+            weight =None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_Stress_Score'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=get_stress_color(row['Stress_Score']),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Stress Score:</b> {row['Stress_Score']:.3f}<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Stress score: {row['Stress_Score']:.3f}"
+        ).add_to(m)
+
+    # **Add color legend as a HTML overlay**
+    min_stress = all_data2['Stress_Score'].min()
+    max_stress = all_data2['Stress_Score'].max()
+    legend_html = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Stress score </b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{low_stress_color}" />
+                    <stop offset="33%" stop-color="{low_stress_color}" />
+                    <stop offset="34%" stop-color="{medium_stress_color}" />
+                    <stop offset="66%" stop-color="{medium_stress_color}" />
+                    <stop offset="67%" stop-color="{high_stress_color}" />
+                    <stop offset="100%" stop-color="{high_stress_color}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Stress Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_stress:.1f}</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.25):.1f}</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.4):.1f}</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.6):.1f}</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_stress:.1f}</text>
+        </svg>
+    </div>
+"""
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file:
+        m.save(temp_file.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file.name, "rb") as f:
+            encoded_html = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html = f"""
+        <iframe src="data:text/html;base64,{encoded_html}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title = dp.Text(f"### Stress Map - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps2.append(title)
+        datapane_html_maps2.append(dp.HTML(iframe_html, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file.name)
+
+# **Create a Datapane Report**
+report2 = dp.Report(
+    dp.Text("# GPS data with Stress levels coloring - Hills Copilot"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps2  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report2.save("gps_stress_dashboard_Hills_copilot.html")  # Save locally
+# report.upload(name="GPS Stress Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_stress_dashboard_Hills_copilot.html' to view it.")
+
+# Normalize temperature for color mapping
+norm_temp = plt.Normalize(all_data2['temperature_celsius'].min(), all_data2['temperature_celsius'].max())
+norm_pulse = plt.Normalize(all_data2['pulse_rate_bpm'].min(), all_data2['pulse_rate_bpm'].max())
+norm_eda = plt.Normalize(all_data2['eda_scl_usiemens'].min(), all_data2['eda_scl_usiemens'].max())
+
+cmap_temp = plt.get_cmap('jet')  # Change colormap if needed
+cmap_pulse = plt.get_cmap('jet')  # You can change this colormap if you prefer
+cmap_eda = plt.get_cmap('jet')  # Another colormap choice
+
+# Get unique dates from the dataset
+all_data2['date'] = all_data2['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data2['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-11-27 07:38:00"),
+    pd.Timestamp("2024-11-27 09:11:00"),
+
+    pd.Timestamp("2024-11-28 07:30:00"),
+    pd.Timestamp("2024-11-28 08:40:00"),
+
+    pd.Timestamp("2024-11-29 07:30:00"),
+    pd.Timestamp("2024-11-29 11:45:00"),
+
+    pd.Timestamp("2024-12-03 07:30:00"),
+    pd.Timestamp("2024-12-03 08:30:00"),
+
+    pd.Timestamp("2024-12-04 07:45:00"),
+    pd.Timestamp("2024-12-04 08:30:00"),
+
+    pd.Timestamp("2024-12-06 07:30:00"),
+    pd.Timestamp("2024-12-06 09:05:00"),
+
+    pd.Timestamp("2024-12-10 07:20:00"),
+    pd.Timestamp("2024-12-10 09:15:00"),
+
+    pd.Timestamp("2024-12-11 07:40:00"),
+    pd.Timestamp("2024-12-11 08:45:00"),
+
+    pd.Timestamp("2024-12-13 07:20:00"),
+    pd.Timestamp("2024-12-13 11:30:00")
+]
+
+# Store maps and corresponding media components
+datapane_html_maps2 = []
+
+for date in unique_dates:
+    daily_data = all_data2[all_data2['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m_temp = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_pulse = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_eda = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+ #   for i in range(len(daily_data) - 1):
+  #      start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+   #     end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+
+    #    temp = daily_data.iloc[i]['temperature_celsius_max']
+     #   pulse = daily_data.iloc[i]['pulse_rate_bpm_max']
+      #  eda = daily_data.iloc[i]['eda_scl_usiemens_max']
+
+        # Get color from temperature
+       # color_temp = mcolors.to_hex(cmap_temp(norm_temp(temp)))
+       # color_pulse = mcolors.to_hex(cmap_pulse(norm_pulse(pulse)))
+       # color_eda = mcolors.to_hex(cmap_eda(norm_eda(eda)))
+
+        #folium.PolyLine([start, end], color=color_temp, weight=8, opacity=0.9).add_to(m_temp)
+        #folium.PolyLine([start, end], color=color_pulse, weight=6, opacity=0.9).add_to(m_pulse)
+        #folium.PolyLine([start, end], color=color_eda, weight=6, opacity=0.9).add_to(m_eda)
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "black"   # Highlight color (changeable)
+            weight = 4       # Highlight weight (changeable)
+        else:
+            color=None
+            weight=None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_temp'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_temp(norm_temp(row['temperature_celsius_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Temp:</b> {row['temperature_celsius_max']}°C<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Temp: {row['temperature_celsius_max']}°C"
+        ).add_to(m_temp)
+
+        folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=row['scaled_radius_HR'],  # Fixed radius
+                    color=color,
+                    weight = weight,
+                    fill=True,
+                    fill_color=mcolors.to_hex(cmap_pulse(norm_pulse(row['pulse_rate_bpm_max']))),
+                    fill_opacity=0.8,
+                    popup=(
+                        f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"<b>Pulse:</b> {row['pulse_rate_bpm_max']}bpm<br>"
+                    ),
+                    tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Pulse: {row['pulse_rate_bpm_max']}bpm"
+                ).add_to(m_pulse)
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_EDA'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_eda(norm_eda(row['eda_scl_usiemens_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>EDA:</b> {row['eda_scl_usiemens_max']}µS<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | EDA: {row['eda_scl_usiemens_max']}µS"
+        ).add_to(m_eda)
+
+    # **Add color legend as a HTML overlay**
+    min_temp = all_data2['temperature_celsius'].min()
+    max_temp = all_data2['temperature_celsius'].max()
+    legend_html_temp = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Temperature (°C)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(max_temp)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Temperature Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_temp:.1f}°C</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.25):.1f}°C</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.5):.1f}°C</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.75):.1f}°C</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_temp:.1f}°C</text>
+        </svg>
+    </div>
+"""
+
+    min_pulse = all_data2['pulse_rate_bpm'].min()
+    max_pulse = all_data2['pulse_rate_bpm'].max()
+    legend_html_pulse = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Pulse (bpm)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(max_pulse)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Pulse Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_pulse:.1f}bpm</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.25):.1f}bpm</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.5):.1f}bpm</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.75):.1f}bpm</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_pulse:.1f}bpm</text>
+        </svg>
+    </div>
+"""
+
+    min_eda = all_data2['eda_scl_usiemens'].min()
+    max_eda = all_data2['eda_scl_usiemens'].max()
+    legend_html_eda = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>EDA (µS)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(max_eda)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- EDA Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_eda:.1f}µS</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.25):.1f}µS</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.5):.1f}µS</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.75):.1f}µS</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_eda:.1f}µS</text>
+        </svg>
+    </div>
+"""
+
+    m_temp.get_root().html.add_child(folium.Element(legend_html_temp))
+    m_pulse.get_root().html.add_child(folium.Element(legend_html_pulse))
+    m_eda.get_root().html.add_child(folium.Element(legend_html_eda))
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_temp:
+        m_temp.save(temp_file_temp.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_temp.name, "rb") as f:
+            encoded_html_temp = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_temp = f"""
+        <iframe src="data:text/html;base64,{encoded_html_temp}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_temp = dp.Text(f"### GPS Trajectory and Temperature - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps2.append(title_temp)
+        datapane_html_maps2.append(dp.HTML(iframe_html_temp, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_temp.name)
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_pulse:
+        m_pulse.save(temp_file_pulse.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_pulse.name, "rb") as f:
+            encoded_html_pulse = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_pulse = f"""
+        <iframe src="data:text/html;base64,{encoded_html_pulse}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_pulse = dp.Text(f"### GPS Trajectory and Heart Rate - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps2.append(title_pulse)
+        datapane_html_maps2.append(dp.HTML(iframe_html_pulse, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_pulse.name)
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_eda:
+        m_eda.save(temp_file_eda.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_eda.name, "rb") as f:
+            encoded_html_eda = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_eda = f"""
+        <iframe src="data:text/html;base64,{encoded_html_eda}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_eda = dp.Text(f"### GPS Trajectory and EDA - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps2.append(title_eda)
+        datapane_html_maps2.append(dp.HTML(iframe_html_eda, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_eda.name)
+
+
+# **Create a Datapane Report**
+report2 = dp.Report(
+    dp.Text("# GPS Trajectory Maps with Biometrics Coloring - Hills Copilot"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps2  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report2.save("gps_biometrics_dashboard_Hills_copilot.html")  # Save locally
+# report.upload(name="GPS Temperature Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_biometrics_dashboard_Hills_copilot.html' to view it.")
+
+#**DHL TRADETEAM: Driver**
+
+# Function to extract longitude, latitude, and date
+def extract_data(description):
+    # Regular expressions for longitude, latitude, and date
+    lon_pattern = r"(-?\d{1}\.\d{5})"  # Longitude: Optional '-' followed by decimal with 7 digits
+    lat_pattern = r"(\d{2}\.\d{5})"  # Latitude: Decimal with 6 digits (always positive)
+    date_pattern = r"(\d{2}/\d{2}/\d{4})\s(\d{2}:\d{2}:\d{2})"  # Date format DD/MM/YYYY HH:MM:SS with space between date and time
+
+    # Extract longitude, latitude, and date using regex
+    longitude_match = re.search(lon_pattern, description)
+    latitude_match = re.search(lat_pattern, description)
+    date_match = re.search(date_pattern, description)
+
+    # If matches are found, convert them to appropriate formats, else assign NaN
+    longitude = float(longitude_match.group(1)) if longitude_match else np.nan
+    latitude = float(latitude_match.group(1)) if latitude_match else np.nan
+
+    # Adjust longitude and latitude extraction logic
+    # If the same value appears for both, assume it's a mistake
+    if longitude and latitude and abs(longitude) == latitude:
+        latitude = np.nan  # If longitude and latitude are the same, treat latitude as NaN
+
+    date = f"{date_match.group(1)} {date_match.group(2)}" if date_match else np.nan
+
+    return longitude, latitude, date
+
+def haversine(lat1, lon1, lat2, lon2):
+    return geodesic((lat1, lon1), (lat2, lon2)).meters
+
+# Clean function to detect and remove outliers
+def clean_gps_data(df, max_distance_threshold=400):
+
+    # Sort by time to ensure points are ordered chronologically
+    df = df.sort_values(by="Time")
+
+    # Initialize a list to store indices to remove
+    outlier_indices = []
+
+    # Loop through the data and calculate distances between consecutive points
+    for i in range(1, len(df)):
+        lat1, lon1 = df.iloc[i-1][['Latitude', 'Longitude']]
+        lat2, lon2 = df.iloc[i][['Latitude', 'Longitude']]
+        distance = haversine(lat1, lon1, lat2, lon2)
+
+        # If the distance exceeds the threshold, mark it as an outlier
+        if distance > max_distance_threshold:
+            outlier_indices.append(i)
+
+    # Remove outliers by dropping the corresponding rows
+    df_cleaned = df.drop(outlier_indices)
+
+    return df_cleaned
+
+# Function to load and process GPS data
+def load_gps_data_dhl(file_path):
+    if not os.path.exists(file_path):
+        print(f"GPS DHL File not found: {file_path}")
+        return None
+    gps_df = pd.read_csv(file_path)
+
+    gps_df[['Longitude', 'Latitude', 'Time']] = gps_df['Event Description'].apply(lambda x: pd.Series(extract_data(x)))
+
+    # Drop all columns except for 'Longitude', 'Latitude', and 'Date'
+    gps_df = gps_df[['Longitude', 'Latitude', 'Time']]
+
+    # Drop rows with any NaN values
+    gps_df = gps_df.dropna()
+
+    # Convert the 'Date' column to datetime64[ns] format
+    gps_df['Time'] = pd.to_datetime(gps_df['Time'], format='%d/%m/%Y %H:%M:%S')
+
+    # Optionally, if you want the date in the specific string format ('YYYY-MM-DD HH:MM:SS')
+    gps_df['Time'] = gps_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    gps_df['Time'] = pd.to_datetime(gps_df['Time'])
+
+    gps_df['Time'] = gps_df['Time'].apply(lambda x: x.replace(second=0))
+
+    gps_df = gps_df.drop_duplicates(subset=['Longitude', 'Latitude', 'Time'])
+
+    gps_df = gps_df.dropna()
+
+    gps_df = gps_df.reset_index(drop=True)
+
+    gps_df = clean_gps_data(gps_df)
+
+    return gps_df
+
+# Base directory and participant ID
+base_dir = "/content/drive/MyDrive/Stress data/Physiological Data"
+participant_id = "03-3YK3313189"
+file_prefix = "1-1-03"
+
+# List of **specific** tracked dates
+tracked_dates = [
+    "2024-12-03",
+    "2024-12-06",
+    "2024-12-10",
+    "2024-12-17",
+    "2024-12-20"
+]
+
+# Collect all max/min values across days for scaling
+all_dataframes3 = []
+
+# Loop through tracked dates only
+for date in tracked_dates:
+    print(f"Processing data for {date}...")
+
+    # Format date for GPS file (YYMMDD)
+    gps_date_format = datetime.strptime(date, "%Y-%m-%d").strftime("%y%m%d")
+
+    # Define file paths
+    eda_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_eda.csv"
+    pulse_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_pulse-rate.csv"
+    temp_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_temperature.csv"
+    met_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_met.csv"
+    gps_file = f"/content/drive/MyDrive/Stress data/{gps_date_format}_DHL.csv"
+
+    # Load datasets
+    eda_df = load_process_data(eda_file, "eda_scl_usiemens")
+    pulse_df = load_process_data(pulse_file, "pulse_rate_bpm")
+    temp_df = load_process_data(temp_file, "temperature_celsius")
+    met_df = load_process_data(met_file, "met")
+    gps_df = load_gps_data_dhl(gps_file)
+
+    # Skip if EDA data is missing (core dataset)
+    if eda_df is None:
+        print(f"Skipping {date} due to missing EDA data.")
+        continue
+
+    # Merge physiological datasets
+    merged_df = eda_df
+    for df in [pulse_df, temp_df, met_df]:
+        if df is not None:
+            merged_df = merged_df.merge(df, on='Time_empatica', how='inner', suffixes=('', '_dup'))
+
+    # Drop duplicate columns
+    merged_df = merged_df.loc[:, ~merged_df.columns.str.endswith('_dup')]
+
+    # Merge with GPS data if available
+    if gps_df is not None:
+        merged_df = merged_df.merge(gps_df, left_on='Time_empatica', right_on='Time', how='left')
+        merged_df[['Latitude', 'Longitude']] = merged_df[['Latitude', 'Longitude']].ffill()
+        merged_df = merged_df.dropna(subset=['Latitude', 'Longitude'])
+
+        # Group by location
+        merged_df['location_group'] = (merged_df['Latitude'] != merged_df['Latitude'].shift()) | (merged_df['Longitude'] != merged_df['Longitude'].shift())
+        merged_df['location_group'] = merged_df['location_group'].cumsum()
+
+        # Compute max values per location
+        max_values = merged_df.groupby('location_group')[['temperature_celsius', 'pulse_rate_bpm', 'eda_scl_usiemens', 'met']].transform('max')
+        merged_df[['temperature_celsius_max', 'pulse_rate_bpm_max', 'eda_scl_usiemens_max', 'met_max']] = max_values
+
+    # Append to list for scaling
+    all_dataframes3.append(merged_df)
+
+# Concatenate all data
+if all_dataframes3:
+    all_data3 = pd.concat(all_dataframes3, ignore_index=True)
+
+    # Compute global min/max for scaling
+    global_min_max = {
+        'temperature_celsius': (all_data3['temperature_celsius_max'].min(), all_data3['temperature_celsius_max'].max()),
+        'pulse_rate_bpm': (all_data3['pulse_rate_bpm_max'].min(), all_data3['pulse_rate_bpm_max'].max()),
+        'eda_scl_usiemens': (all_data3['eda_scl_usiemens_max'].min(), all_data3['eda_scl_usiemens_max'].max()),
+        'met': (all_data3['met_max'].min(), all_data3['met_max'].max())
+    }
+
+    # Function to scale values between 5 and 15
+    def scale_values(value, min_val, max_val):
+        return 5 + (value - min_val) / (max_val - min_val) * 10 if max_val > min_val else 5
+
+    # Apply scaling
+    all_data3['scaled_radius_temp'] = all_data3['temperature_celsius_max'].apply(lambda x: scale_values(x, *global_min_max['temperature_celsius']))
+    all_data3['scaled_radius_HR'] = all_data3['pulse_rate_bpm_max'].apply(lambda x: scale_values(x, *global_min_max['pulse_rate_bpm']))
+    all_data3['scaled_radius_EDA'] = all_data3['eda_scl_usiemens_max'].apply(lambda x: scale_values(x, *global_min_max['eda_scl_usiemens']))
+    all_data3['scaled_radius_MET'] = all_data3['met_max'].apply(lambda x: scale_values(x, *global_min_max['met']))
+
+    print("All tracked days successfully processed and scaled!")
+
+else:
+    print("No data processed.")
+
+
+# ------------------------ Processing signals ------------------------ #
+
+# Preprocess signals
+all_data3["Filtered_EDA"] = preprocess_signal(all_data3["eda_scl_usiemens"])
+all_data3["Normalized_HR"] = preprocess_signal(all_data3["pulse_rate_bpm"])
+all_data3["Normalized_TEMP"] = preprocess_signal(all_data3["temperature_celsius"])
+
+# Group data by 10-minute intervals
+all_data3["TimeWindow"] = all_data3["Time_empatica"].dt.floor('10T')  # Floor to nearest 10-minute interval
+all_data3["Date"] = all_data3["Time_empatica"].dt.date
+
+all_data3["Stress_Score"] = np.nan
+all_data3["EDA_Score"] = np.nan
+all_data3["HRV_Score"] = np.nan
+all_data3["TEMP_Score"] = np.nan
+
+for time_window, group in all_data3.groupby("TimeWindow"):
+    eda_peak_count, eda_amplitude = extract_eda_features(group["Filtered_EDA"])
+    temp_mean, temp_drop = extract_temp_features(group["Normalized_TEMP"])
+
+    # Normalize features
+    eda_score = (eda_peak_count + eda_amplitude) / 2 if not np.isnan(eda_peak_count) else 0
+     # Ensure HRV values are valid before computations
+    hrv_score = compute_hrv_score(group['pulse_rate_bpm'])
+    temp_score = (1 / (temp_mean + 1) if not np.isnan(temp_mean) else 0) + \
+                 (1 / (abs(temp_drop) + 1) if not np.isnan(temp_drop) else 0)
+
+    # Define weights (adjustable)
+    w_eda, w_hrv, w_temp = 0.5, 0.3, 0.2
+
+    # Compute daily stress score
+    stress_score = w_eda * eda_score + w_hrv * hrv_score + w_temp * temp_score
+
+    # Assign stress score to all data points in the same time window
+    all_data3.loc[all_data3["TimeWindow"] == time_window, "Stress_Score"] = stress_score
+    all_data3.loc[all_data3["TimeWindow"] == time_window, "EDA_Score"] = eda_score
+    all_data3.loc[all_data3["TimeWindow"] == time_window, "HRV_Score"] = hrv_score
+    all_data3.loc[all_data3["TimeWindow"] == time_window, "TEMP_Score"] = temp_score
+
+#all_data3 = all_data2[~(all_data2['Stress_Score'] > 1)]
+
+# ------------------------ Generate Plots Per Day ------------------------ #
+unique_dates = all_data3["Date"].unique()
+
+# Define three distinct colors from the 'jet' colormap for the three stress levels
+
+low_stress_color = cm.jet(0.2)  # Color for stress scores 0.2 - 0.4
+medium_stress_color = cm.jet(0.55)  # Color for stress scores 0.4 - 0.7
+high_stress_color = cm.jet(0.8)  # Color for stress scores > 0.7
+
+for date in unique_dates:
+    daily_data = all_data3[all_data3["Date"] == date]
+
+    colors = colors = [
+    high_stress_color if score > 0.7 else
+    medium_stress_color if score >= 0.4 else
+    low_stress_color
+    for score in daily_data["Stress_Score"]]
+
+    plt.figure(figsize=(12, 5))
+    plt.bar(daily_data["TimeWindow"], daily_data["Stress_Score"], color=colors, width=0.006)
+    plt.xlabel("Time")
+    plt.ylabel("Stress Score")
+    plt.title(f"10-Minute-Based Stress Score on {date}")
+    plt.xticks(rotation=45)
+    plt.ylim(0, 1)
+
+   # Use proper date formatting for x-axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Show only hours & minutes
+    plt.gca().xaxis.set_major_locator(mdates.HourLocator(interval=1))  # Show labels every hour
+
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+
+
+    legend_patches = [
+    mpatches.Patch(color=low_stress_color, label="Low Stress (<0.4)"),
+    mpatches.Patch(color=medium_stress_color, label="Medium Stress (0.4 - 0.7)"),
+    mpatches.Patch(color=high_stress_color, label="High Stress (>0.7)")
+    ]
+    plt.legend(handles=legend_patches, loc="upper right")
+    plt.show()
+
+
+all_data3['scaled_Stress_Score'] = all_data3['Stress_Score'].apply(lambda x: scale_values(x,all_data3['Stress_Score'].min(),all_data3['Stress_Score'].max()))
+cmap = plt.get_cmap('jet')  # Change colormap if needed
+
+# Get unique dates from the dataset
+all_data3['date'] = all_data3['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data3['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-12-03 05:49:00"),
+    pd.Timestamp("2024-12-03 06:42:00"),
+
+    pd.Timestamp("2024-12-06 06:11:00"),
+    pd.Timestamp("2024-12-06 07:15:00"),
+
+    pd.Timestamp("2024-12-10 05:42:00"),
+    pd.Timestamp("2024-12-10 08:21:00"),
+
+    pd.Timestamp("2024-12-17 06:19:00"),
+    pd.Timestamp("2024-12-17 11:43:00"),
+
+    pd.Timestamp("2024-12-20 06:09:00"),
+    pd.Timestamp("2024-12-20 06:54:00")
+]
+
+
+# Store maps and corresponding media components
+datapane_html_maps3 = []
+
+for date in unique_dates:
+    daily_data = all_data3[all_data3['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+   # for i in range(len(daily_data) - 1):
+    #    start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+     #   end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+      #  temp = daily_data.iloc[i]['temperature_celsius_max']
+
+        # Get color from temperature
+       # color = mcolors.to_hex(cmap(norm(temp)))
+
+        #folium.PolyLine([start, end], color=color, weight=8, opacity=0.9).add_to(m)
+
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+
+        low_stress_color = mcolors.to_hex(cm.jet(0.2))  # Color for stress scores 0.2 - 0.4
+        medium_stress_color = mcolors.to_hex(cm.jet(0.55))  # Color for stress scores 0.4 - 0.7
+        high_stress_color = mcolors.to_hex(cm.jet(0.8))  # Color for stress scores > 0.7
+
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "red"   # Highlight color (changeable)
+            weight = 4
+        else:
+            color=None
+            weight =None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_Stress_Score'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=get_stress_color(row['Stress_Score']),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Stress Score:</b> {row['Stress_Score']:.3f}<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Stress score: {row['Stress_Score']:.3f}"
+        ).add_to(m)
+
+    # **Add color legend as a HTML overlay**
+    min_stress = all_data3['Stress_Score'].min()
+    max_stress = all_data3['Stress_Score'].max()
+    legend_html = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Stress score </b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{low_stress_color}" />
+                    <stop offset="33%" stop-color="{low_stress_color}" />
+                    <stop offset="34%" stop-color="{medium_stress_color}" />
+                    <stop offset="66%" stop-color="{medium_stress_color}" />
+                    <stop offset="67%" stop-color="{high_stress_color}" />
+                    <stop offset="100%" stop-color="{high_stress_color}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Stress Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_stress:.1f}</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.25):.1f}</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.4):.1f}</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.6):.1f}</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_stress:.1f}</text>
+        </svg>
+    </div>
+"""
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file:
+        m.save(temp_file.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file.name, "rb") as f:
+            encoded_html = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html = f"""
+        <iframe src="data:text/html;base64,{encoded_html}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title = dp.Text(f"### Stress Map - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps3.append(title)
+        datapane_html_maps3.append(dp.HTML(iframe_html, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file.name)
+
+# **Create a Datapane Report**
+report3 = dp.Report(
+    dp.Text("# GPS data with Stress levels coloring - DHL Driver"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps3  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report3.save("gps_stress_dashboard_DHL_driver.html")  # Save locally
+# report.upload(name="GPS Stress Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_stress_dashboard_DHL_driver.html' to view it.")
+
+# Normalize temperature for color mapping
+norm_temp = plt.Normalize(all_data3['temperature_celsius'].min(), all_data3['temperature_celsius'].max())
+norm_pulse = plt.Normalize(all_data3['pulse_rate_bpm'].min(), all_data3['pulse_rate_bpm'].max())
+norm_eda = plt.Normalize(all_data3['eda_scl_usiemens'].min(), all_data3['eda_scl_usiemens'].max())
+
+cmap_temp = plt.get_cmap('jet')  # Change colormap if needed
+cmap_pulse = plt.get_cmap('jet')  # You can change this colormap if you prefer
+cmap_eda = plt.get_cmap('jet')  # Another colormap choice
+
+# Get unique dates from the dataset
+all_data3['date'] = all_data3['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data3['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-12-03 05:49:00"),
+    pd.Timestamp("2024-12-03 06:42:00"),
+
+    pd.Timestamp("2024-12-06 06:11:00"),
+    pd.Timestamp("2024-12-06 07:15:00"),
+
+    pd.Timestamp("2024-12-10 05:42:00"),
+    pd.Timestamp("2024-12-10 08:21:00"),
+
+    pd.Timestamp("2024-12-17 06:19:00"),
+    pd.Timestamp("2024-12-17 11:43:00"),
+
+    pd.Timestamp("2024-12-20 06:09:00"),
+    pd.Timestamp("2024-12-20 06:54:00")
+]
+
+# Store maps and corresponding media components
+datapane_html_maps3 = []
+
+for date in unique_dates:
+    daily_data = all_data3[all_data3['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m_temp = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_pulse = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_eda = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+ #   for i in range(len(daily_data) - 1):
+  #      start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+   #     end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+
+    #    temp = daily_data.iloc[i]['temperature_celsius_max']
+     #   pulse = daily_data.iloc[i]['pulse_rate_bpm_max']
+      #  eda = daily_data.iloc[i]['eda_scl_usiemens_max']
+
+        # Get color from temperature
+       # color_temp = mcolors.to_hex(cmap_temp(norm_temp(temp)))
+       # color_pulse = mcolors.to_hex(cmap_pulse(norm_pulse(pulse)))
+       # color_eda = mcolors.to_hex(cmap_eda(norm_eda(eda)))
+
+        #folium.PolyLine([start, end], color=color_temp, weight=8, opacity=0.9).add_to(m_temp)
+        #folium.PolyLine([start, end], color=color_pulse, weight=6, opacity=0.9).add_to(m_pulse)
+        #folium.PolyLine([start, end], color=color_eda, weight=6, opacity=0.9).add_to(m_eda)
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "red"   # Highlight color (changeable)
+            weight = 4       # Highlight weight (changeable)
+        else:
+            color=None
+            weight=None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_temp'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_temp(norm_temp(row['temperature_celsius_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Temp:</b> {row['temperature_celsius_max']}°C<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Temp: {row['temperature_celsius_max']}°C"
+        ).add_to(m_temp)
+
+        folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=row['scaled_radius_HR'],  # Fixed radius
+                    color=color,
+                    weight = weight,
+                    fill=True,
+                    fill_color=mcolors.to_hex(cmap_pulse(norm_pulse(row['pulse_rate_bpm_max']))),
+                    fill_opacity=0.8,
+                    popup=(
+                        f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"<b>Pulse:</b> {row['pulse_rate_bpm_max']}bpm<br>"
+                    ),
+                    tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Pulse: {row['pulse_rate_bpm_max']}bpm"
+                ).add_to(m_pulse)
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_EDA'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_eda(norm_eda(row['eda_scl_usiemens_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>EDA:</b> {row['eda_scl_usiemens_max']}µS<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | EDA: {row['eda_scl_usiemens_max']}µS"
+        ).add_to(m_eda)
+
+    # **Add color legend as a HTML overlay**
+    min_temp = all_data3['temperature_celsius'].min()
+    max_temp = all_data3['temperature_celsius'].max()
+    legend_html_temp = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Temperature (°C)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(max_temp)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Temperature Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_temp:.1f}°C</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.25):.1f}°C</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.5):.1f}°C</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.75):.1f}°C</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_temp:.1f}°C</text>
+        </svg>
+    </div>
+"""
+
+    min_pulse = all_data3['pulse_rate_bpm'].min()
+    max_pulse = all_data3['pulse_rate_bpm'].max()
+    legend_html_pulse = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Pulse (bpm)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(max_pulse)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Pulse Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_pulse:.1f}bpm</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.25):.1f}bpm</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.5):.1f}bpm</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.75):.1f}bpm</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_pulse:.1f}bpm</text>
+        </svg>
+    </div>
+"""
+
+    min_eda = all_data3['eda_scl_usiemens'].min()
+    max_eda = all_data3['eda_scl_usiemens'].max()
+    legend_html_eda = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>EDA (µS)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(max_eda)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- EDA Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_eda:.1f}µS</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.25):.1f}µS</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.5):.1f}µS</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.75):.1f}µS</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_eda:.1f}µS</text>
+        </svg>
+    </div>
+"""
+
+    m_temp.get_root().html.add_child(folium.Element(legend_html_temp))
+    m_pulse.get_root().html.add_child(folium.Element(legend_html_pulse))
+    m_eda.get_root().html.add_child(folium.Element(legend_html_eda))
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_temp:
+        m_temp.save(temp_file_temp.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_temp.name, "rb") as f:
+            encoded_html_temp = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_temp = f"""
+        <iframe src="data:text/html;base64,{encoded_html_temp}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_temp = dp.Text(f"### GPS Trajectory and Temperature - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps3.append(title_temp)
+        datapane_html_maps3.append(dp.HTML(iframe_html_temp, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_temp.name)
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_pulse:
+        m_pulse.save(temp_file_pulse.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_pulse.name, "rb") as f:
+            encoded_html_pulse = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_pulse = f"""
+        <iframe src="data:text/html;base64,{encoded_html_pulse}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_pulse = dp.Text(f"### GPS Trajectory and Heart Rate - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps3.append(title_pulse)
+        datapane_html_maps3.append(dp.HTML(iframe_html_pulse, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_pulse.name)
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_eda:
+        m_eda.save(temp_file_eda.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_eda.name, "rb") as f:
+            encoded_html_eda = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_eda = f"""
+        <iframe src="data:text/html;base64,{encoded_html_eda}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_eda = dp.Text(f"### GPS Trajectory and EDA - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps3.append(title_eda)
+        datapane_html_maps3.append(dp.HTML(iframe_html_eda, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_eda.name)
+
+
+# **Create a Datapane Report**
+report3 = dp.Report(
+    dp.Text("# GPS Trajectory Maps with Biometrics Coloring - DHL Driver"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps3  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report3.save("gps_biometrics_dashboard_DHL_driver.html")  # Save locally
+# report.upload(name="GPS Temperature Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_biometrics_dashboard_DHL_driver.html' to view it.")
+
+#**DHL TRADETEAM: Copilot**
+
+# Base directory and participant ID
+base_dir = "/content/drive/MyDrive/Stress data/Physiological Data"
+participant_id = "04-3YK33134KM"
+file_prefix = "1-1-04"
+
+# List of **specific** tracked dates
+tracked_dates = [
+    "2024-12-03",
+    "2024-12-10",
+    "2024-12-13",
+    "2024-12-17",
+    "2024-12-20",
+    "2024-12-28"
+]
+
+# Collect all max/min values across days for scaling
+all_dataframes4 = []
+
+# Loop through tracked dates only
+for date in tracked_dates:
+    print(f"Processing data for {date}...")
+
+    # Format date for GPS file (YYMMDD)
+    gps_date_format = datetime.strptime(date, "%Y-%m-%d").strftime("%y%m%d")
+
+    # Define file paths
+    eda_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_eda.csv"
+    pulse_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_pulse-rate.csv"
+    temp_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_temperature.csv"
+    met_file = f"{base_dir}/{date}/{participant_id}/{file_prefix}_{date}_met.csv"
+    gps_file = f"/content/drive/MyDrive/Stress data/{gps_date_format}_DHL.csv"
+
+    # Load datasets
+    eda_df = load_process_data(eda_file, "eda_scl_usiemens")
+    pulse_df = load_process_data(pulse_file, "pulse_rate_bpm")
+    temp_df = load_process_data(temp_file, "temperature_celsius")
+    met_df = load_process_data(met_file, "met")
+    gps_df = load_gps_data_dhl(gps_file)
+
+    # Skip if EDA data is missing (core dataset)
+    if eda_df is None:
+        print(f"Skipping {date} due to missing EDA data.")
+        continue
+
+    # Merge physiological datasets
+    merged_df = eda_df
+    for df in [pulse_df, temp_df, met_df]:
+        if df is not None:
+            merged_df = merged_df.merge(df, on='Time_empatica', how='inner', suffixes=('', '_dup'))
+
+    # Drop duplicate columns
+    merged_df = merged_df.loc[:, ~merged_df.columns.str.endswith('_dup')]
+
+    # Merge with GPS data if available
+    if gps_df is not None:
+        merged_df = merged_df.merge(gps_df, left_on='Time_empatica', right_on='Time', how='left')
+        merged_df[['Latitude', 'Longitude']] = merged_df[['Latitude', 'Longitude']].ffill()
+        merged_df = merged_df.dropna(subset=['Latitude', 'Longitude'])
+
+        # Group by location
+        merged_df['location_group'] = (merged_df['Latitude'] != merged_df['Latitude'].shift()) | (merged_df['Longitude'] != merged_df['Longitude'].shift())
+        merged_df['location_group'] = merged_df['location_group'].cumsum()
+
+        # Compute max values per location
+        max_values = merged_df.groupby('location_group')[['temperature_celsius', 'pulse_rate_bpm', 'eda_scl_usiemens', 'met']].transform('max')
+        merged_df[['temperature_celsius_max', 'pulse_rate_bpm_max', 'eda_scl_usiemens_max', 'met_max']] = max_values
+
+    # Append to list for scaling
+    all_dataframes4.append(merged_df)
+
+# Concatenate all data
+if all_dataframes4:
+    all_data4 = pd.concat(all_dataframes4, ignore_index=True)
+
+    # Compute global min/max for scaling
+    global_min_max = {
+        'temperature_celsius': (all_data4['temperature_celsius_max'].min(), all_data4['temperature_celsius_max'].max()),
+        'pulse_rate_bpm': (all_data4['pulse_rate_bpm_max'].min(), all_data4['pulse_rate_bpm_max'].max()),
+        'eda_scl_usiemens': (all_data4['eda_scl_usiemens_max'].min(), all_data4['eda_scl_usiemens_max'].max()),
+        'met': (all_data4['met_max'].min(), all_data4['met_max'].max())
+    }
+
+    # Function to scale values between 5 and 15
+    def scale_values(value, min_val, max_val):
+        return 5 + (value - min_val) / (max_val - min_val) * 10 if max_val > min_val else 5
+
+    # Apply scaling
+    all_data4['scaled_radius_temp'] = all_data4['temperature_celsius_max'].apply(lambda x: scale_values(x, *global_min_max['temperature_celsius']))
+    all_data4['scaled_radius_HR'] = all_data4['pulse_rate_bpm_max'].apply(lambda x: scale_values(x, *global_min_max['pulse_rate_bpm']))
+    all_data4['scaled_radius_EDA'] = all_data4['eda_scl_usiemens_max'].apply(lambda x: scale_values(x, *global_min_max['eda_scl_usiemens']))
+    all_data4['scaled_radius_MET'] = all_data4['met_max'].apply(lambda x: scale_values(x, *global_min_max['met']))
+
+    print("All tracked days successfully processed and scaled!")
+
+else:
+    print("No data processed.")
+
+
+# ------------------------ Processing signals ------------------------ #
+
+# Preprocess signals
+all_data4["Filtered_EDA"] = preprocess_signal(all_data4["eda_scl_usiemens"])
+all_data4["Normalized_HR"] = preprocess_signal(all_data4["pulse_rate_bpm"])
+all_data4["Normalized_TEMP"] = preprocess_signal(all_data4["temperature_celsius"])
+
+# Group data by 10-minute intervals
+all_data4["TimeWindow"] = all_data4["Time_empatica"].dt.floor('10T')  # Floor to nearest 10-minute interval
+all_data4["Date"] = all_data4["Time_empatica"].dt.date
+
+all_data4["Stress_Score"] = np.nan
+all_data4["EDA_Score"] = np.nan
+all_data4["HRV_Score"] = np.nan
+all_data4["TEMP_Score"] = np.nan
+
+for time_window, group in all_data4.groupby("TimeWindow"):
+    eda_peak_count, eda_amplitude = extract_eda_features(group["Filtered_EDA"])
+    temp_mean, temp_drop = extract_temp_features(group["Normalized_TEMP"])
+
+    # Normalize features
+    eda_score = (eda_peak_count + eda_amplitude) / 2 if not np.isnan(eda_peak_count) else 0
+     # Ensure HRV values are valid before computations
+    hrv_score = compute_hrv_score(group['pulse_rate_bpm'])
+    temp_score = (1 / (temp_mean + 1) if not np.isnan(temp_mean) else 0) + \
+                 (1 / (abs(temp_drop) + 1) if not np.isnan(temp_drop) else 0)
+
+    # Define weights (adjustable)
+    w_eda, w_hrv, w_temp = 0.5, 0.3, 0.2
+
+    # Compute daily stress score
+    stress_score = w_eda * eda_score + w_hrv * hrv_score + w_temp * temp_score
+
+    # Assign stress score to all data points in the same time window
+    all_data4.loc[all_data4["TimeWindow"] == time_window, "Stress_Score"] = stress_score
+    all_data4.loc[all_data4["TimeWindow"] == time_window, "EDA_Score"] = eda_score
+    all_data4.loc[all_data4["TimeWindow"] == time_window, "HRV_Score"] = hrv_score
+    all_data4.loc[all_data4["TimeWindow"] == time_window, "TEMP_Score"] = temp_score
+
+all_data4 = all_data4[~(all_data4['Stress_Score'] > 1)]
+
+# ------------------------ Generate Plots Per Day ------------------------ #
+unique_dates = all_data4["Date"].unique()
+
+# Define three distinct colors from the 'jet' colormap for the three stress levels
+
+low_stress_color = cm.jet(0.2)  # Color for stress scores 0.2 - 0.4
+medium_stress_color = cm.jet(0.55)  # Color for stress scores 0.4 - 0.7
+high_stress_color = cm.jet(0.8)  # Color for stress scores > 0.7
+
+for date in unique_dates:
+    daily_data = all_data4[all_data4["Date"] == date]
+
+    colors = colors = [
+    high_stress_color if score > 0.7 else
+    medium_stress_color if score >= 0.4 else
+    low_stress_color
+    for score in daily_data["Stress_Score"]]
+
+    plt.figure(figsize=(12, 5))
+    plt.bar(daily_data["TimeWindow"], daily_data["Stress_Score"], color=colors, width=0.006)
+    plt.xlabel("Time")
+    plt.ylabel("Stress Score")
+    plt.title(f"10-Minute-Based Stress Score on {date}")
+    plt.xticks(rotation=45)
+    plt.ylim(0, 1)
+
+   # Use proper date formatting for x-axis
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))  # Show only hours & minutes
+    plt.gca().xaxis.set_major_locator(mdates.HourLocator(interval=1))  # Show labels every hour
+
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+
+
+    legend_patches = [
+    mpatches.Patch(color=low_stress_color, label="Low Stress (<0.4)"),
+    mpatches.Patch(color=medium_stress_color, label="Medium Stress (0.4 - 0.7)"),
+    mpatches.Patch(color=high_stress_color, label="High Stress (>0.7)")
+    ]
+    plt.legend(handles=legend_patches, loc="upper right")
+    plt.show()
+
+all_data4['scaled_Stress_Score'] = all_data4['Stress_Score'].apply(lambda x: scale_values(x,all_data4['Stress_Score'].min(),all_data4['Stress_Score'].max()))
+cmap = plt.get_cmap('jet')  # Change colormap if needed
+
+# Get unique dates from the dataset
+all_data4['date'] = all_data4['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data4['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-12-03 05:49:00"),
+    pd.Timestamp("2024-12-03 06:42:00"),
+
+    pd.Timestamp("2024-12-10 05:42:00"),
+    pd.Timestamp("2024-12-10 08:21:00"),
+
+    pd.Timestamp("2024-12-13 06:08:00"),
+    pd.Timestamp("2024-12-13 07:04:00"),
+
+    pd.Timestamp("2024-12-17 06:19:00"),
+    pd.Timestamp("2024-12-17 11:43:00"),
+
+    pd.Timestamp("2024-12-20 06:09:00"),
+    pd.Timestamp("2024-12-20 06:54:00"),
+
+    pd.Timestamp("2024-12-28 07:10:00"),
+    pd.Timestamp("2024-12-28 09:29:00")
+]
+
+
+# Store maps and corresponding media components
+datapane_html_maps4 = []
+
+for date in unique_dates:
+    daily_data = all_data4[all_data4['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+   # for i in range(len(daily_data) - 1):
+    #    start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+     #   end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+      #  temp = daily_data.iloc[i]['temperature_celsius_max']
+
+        # Get color from temperature
+       # color = mcolors.to_hex(cmap(norm(temp)))
+
+        #folium.PolyLine([start, end], color=color, weight=8, opacity=0.9).add_to(m)
+
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+
+        low_stress_color = mcolors.to_hex(cm.jet(0.2))  # Color for stress scores 0.2 - 0.4
+        medium_stress_color = mcolors.to_hex(cm.jet(0.55))  # Color for stress scores 0.4 - 0.7
+        high_stress_color = mcolors.to_hex(cm.jet(0.8))  # Color for stress scores > 0.7
+
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "red"   # Highlight color (changeable)
+            weight = 4
+        else:
+            color=None
+            weight =None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_Stress_Score'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=get_stress_color(row['Stress_Score']),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Stress Score:</b> {row['Stress_Score']:.3f}<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Stress score: {row['Stress_Score']:.3f}"
+        ).add_to(m)
+
+    # **Add color legend as a HTML overlay**
+    min_stress = all_data3['Stress_Score'].min()
+    max_stress = all_data3['Stress_Score'].max()
+    legend_html = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Stress score </b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{low_stress_color}" />
+                    <stop offset="33%" stop-color="{low_stress_color}" />
+                    <stop offset="34%" stop-color="{medium_stress_color}" />
+                    <stop offset="66%" stop-color="{medium_stress_color}" />
+                    <stop offset="67%" stop-color="{high_stress_color}" />
+                    <stop offset="100%" stop-color="{high_stress_color}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Stress Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_stress:.1f}</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.25):.1f}</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.4):.1f}</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_stress + (max_stress-min_stress)*0.6):.1f}</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_stress:.1f}</text>
+        </svg>
+    </div>
+"""
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file:
+        m.save(temp_file.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file.name, "rb") as f:
+            encoded_html = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html = f"""
+        <iframe src="data:text/html;base64,{encoded_html}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title = dp.Text(f"### Stress Map - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps4.append(title)
+        datapane_html_maps4.append(dp.HTML(iframe_html, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file.name)
+
+# **Create a Datapane Report**
+report4 = dp.Report(
+    dp.Text("# GPS data with Stress levels coloring - DHL copilot"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps4  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report4.save("gps_stress_dashboard_DHL_copilot.html")  # Save locally
+# report.upload(name="GPS Stress Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_stress_dashboard_DHL_copilot.html' to view it.")
+
+# Normalize temperature for color mapping
+norm_temp = plt.Normalize(all_data4['temperature_celsius'].min(), all_data4['temperature_celsius'].max())
+norm_pulse = plt.Normalize(all_data4['pulse_rate_bpm'].min(), all_data4['pulse_rate_bpm'].max())
+norm_eda = plt.Normalize(all_data4['eda_scl_usiemens'].min(), all_data4['eda_scl_usiemens'].max())
+
+cmap_temp = plt.get_cmap('jet')  # Change colormap if needed
+cmap_pulse = plt.get_cmap('jet')  # You can change this colormap if you prefer
+cmap_eda = plt.get_cmap('jet')  # Another colormap choice
+
+# Get unique dates from the dataset
+all_data4['date'] = all_data4['Time_empatica'].dt.date  # Extract just the date part
+unique_dates = all_data4['date'].unique()
+
+# Define times to highlight
+highlight_times = [
+    pd.Timestamp("2024-12-03 05:49:00"),
+    pd.Timestamp("2024-12-03 06:42:00"),
+
+    pd.Timestamp("2024-12-10 05:42:00"),
+    pd.Timestamp("2024-12-10 08:21:00"),
+
+    pd.Timestamp("2024-12-13 06:08:00"),
+    pd.Timestamp("2024-12-13 07:04:00"),
+
+    pd.Timestamp("2024-12-17 06:19:00"),
+    pd.Timestamp("2024-12-17 11:43:00"),
+
+    pd.Timestamp("2024-12-20 06:09:00"),
+    pd.Timestamp("2024-12-20 06:54:00"),
+
+    pd.Timestamp("2024-12-28 07:10:00"),
+    pd.Timestamp("2024-12-28 09:29:00")
+]
+
+# Store maps and corresponding media components
+datapane_html_maps4 = []
+
+for date in unique_dates:
+    daily_data = all_data4[all_data4['date'] == date].sort_values(by='Time_empatica')
+
+    # Initialize a Folium map centered around the first GPS point of the day
+    m_temp = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_pulse = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+    m_eda = folium.Map(location=[51.50560461, -0.09112216], zoom_start=15, tiles='CartoDB Positron')
+
+    # Add trip segments with color based on temperature
+ #   for i in range(len(daily_data) - 1):
+  #      start = (daily_data.iloc[i]['Latitude'], daily_data.iloc[i]['Longitude'])
+   #     end = (daily_data.iloc[i + 1]['Latitude'], daily_data.iloc[i + 1]['Longitude'])
+
+    #    temp = daily_data.iloc[i]['temperature_celsius_max']
+     #   pulse = daily_data.iloc[i]['pulse_rate_bpm_max']
+      #  eda = daily_data.iloc[i]['eda_scl_usiemens_max']
+
+        # Get color from temperature
+       # color_temp = mcolors.to_hex(cmap_temp(norm_temp(temp)))
+       # color_pulse = mcolors.to_hex(cmap_pulse(norm_pulse(pulse)))
+       # color_eda = mcolors.to_hex(cmap_eda(norm_eda(eda)))
+
+        #folium.PolyLine([start, end], color=color_temp, weight=8, opacity=0.9).add_to(m_temp)
+        #folium.PolyLine([start, end], color=color_pulse, weight=6, opacity=0.9).add_to(m_pulse)
+        #folium.PolyLine([start, end], color=color_eda, weight=6, opacity=0.9).add_to(m_eda)
+
+    # Add markers with time information
+    for _, row in daily_data.iterrows():
+        # Check if this time is in the highlight list
+        if row['Time_empatica'] in highlight_times:
+            color = "black"   # Highlight color (changeable)
+            weight = 10       # Highlight weight (changeable)
+        else:
+            color=None
+            weight=None
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_temp'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_temp(norm_temp(row['temperature_celsius_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>Temp:</b> {row['temperature_celsius_max']}°C<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Temp: {row['temperature_celsius_max']}°C"
+        ).add_to(m_temp)
+
+        folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=row['scaled_radius_HR'],  # Fixed radius
+                    color=color,
+                    weight = weight,
+                    fill=True,
+                    fill_color=mcolors.to_hex(cmap_pulse(norm_pulse(row['pulse_rate_bpm_max']))),
+                    fill_opacity=0.8,
+                    popup=(
+                        f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"<b>Pulse:</b> {row['pulse_rate_bpm_max']}bpm<br>"
+                    ),
+                    tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | Pulse: {row['pulse_rate_bpm_max']}bpm"
+                ).add_to(m_pulse)
+
+        folium.CircleMarker(
+            location=[row['Latitude'], row['Longitude']],
+            radius=row['scaled_radius_EDA'],  # Fixed radius
+            color=color,
+            weight = weight,
+            fill=True,
+            fill_color=mcolors.to_hex(cmap_eda(norm_eda(row['eda_scl_usiemens_max']))),
+            fill_opacity=0.8,
+            popup=(
+                f"Time: {row['Time_empatica'].strftime('%Y-%m-%d %H:%M')}<br>"
+                f"<b>EDA:</b> {row['eda_scl_usiemens_max']}µS<br>"
+            ),
+            tooltip=f"Time: {row['Time_empatica'].strftime('%H:%M')} | EDA: {row['eda_scl_usiemens_max']}µS"
+        ).add_to(m_eda)
+
+    # **Add color legend as a HTML overlay**
+    min_temp = all_data4['temperature_celsius'].min()
+    max_temp = all_data4['temperature_celsius'].max()
+    legend_html_temp = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Temperature (°C)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(min_temp + (max_temp-min_temp)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_temp(norm_temp(max_temp)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Temperature Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_temp:.1f}°C</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.25):.1f}°C</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.5):.1f}°C</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_temp + (max_temp-min_temp)*0.75):.1f}°C</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_temp:.1f}°C</text>
+        </svg>
+    </div>
+"""
+
+    min_pulse = all_data4['pulse_rate_bpm'].min()
+    max_pulse = all_data4['pulse_rate_bpm'].max()
+    legend_html_pulse = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>Pulse (bpm)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(min_pulse + (max_pulse-min_pulse)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_pulse(norm_pulse(max_pulse)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- Pulse Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_pulse:.1f}bpm</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.25):.1f}bpm</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.5):.1f}bpm</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_pulse + (max_pulse-min_pulse)*0.75):.1f}bpm</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_pulse:.1f}bpm</text>
+        </svg>
+    </div>
+"""
+
+    min_eda = all_data4['eda_scl_usiemens'].min()
+    max_eda = all_data4['eda_scl_usiemens'].max()
+    legend_html_eda = f"""
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 460px; height: 100px;
+                background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent background */
+                z-index:9999; font-size:14px; padding:15px;
+                border-radius:10px; box-shadow: 0px 0px 10px rgba(0,0,0,0.5); text-align:center;">
+        <b>EDA (µS)</b><br>
+        <svg width="400" height="70">
+            <defs>
+                <linearGradient id="gradient">
+                    <stop offset="0%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda)))}" />
+                    <stop offset="25%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.25)))}" />
+                    <stop offset="50%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.5)))}" />
+                    <stop offset="75%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(min_eda + (max_eda-min_eda)*0.75)))}" />
+                    <stop offset="100%" stop-color="{mcolors.to_hex(cmap_eda(norm_eda(max_eda)))}" />
+                </linearGradient>
+            </defs>
+            <!-- Gradient Bar -->
+            <rect x="10" y="5" width="380" height="30" fill="url(#gradient)" stroke="black" stroke-width="1"/>
+
+            <!-- EDA Labels BELOW the gradient bar -->
+            <text x="8" y="55" font-size="14" fill="black" font-weight="bold">{min_eda:.1f}µS</text>
+            <text x="90" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.25):.1f}µS</text>
+            <text x="180" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.5):.1f}µS</text>
+            <text x="270" y="55" font-size="14" fill="black" font-weight="bold">{(min_eda + (max_eda-min_eda)*0.75):.1f}µS</text>
+            <text x="350" y="55" font-size="14" fill="black" font-weight="bold">{max_eda:.1f}µS</text>
+        </svg>
+    </div>
+"""
+
+    m_temp.get_root().html.add_child(folium.Element(legend_html_temp))
+    m_pulse.get_root().html.add_child(folium.Element(legend_html_pulse))
+    m_eda.get_root().html.add_child(folium.Element(legend_html_eda))
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_temp:
+        m_temp.save(temp_file_temp.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_temp.name, "rb") as f:
+            encoded_html_temp = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_temp = f"""
+        <iframe src="data:text/html;base64,{encoded_html_temp}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_temp = dp.Text(f"### GPS Trajectory and Temperature - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps4.append(title_temp)
+        datapane_html_maps4.append(dp.HTML(iframe_html_temp, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_temp.name)
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_pulse:
+        m_pulse.save(temp_file_pulse.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_pulse.name, "rb") as f:
+            encoded_html_pulse = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_pulse = f"""
+        <iframe src="data:text/html;base64,{encoded_html_pulse}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_pulse = dp.Text(f"### GPS Trajectory and Heart Rate - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps4.append(title_pulse)
+        datapane_html_maps4.append(dp.HTML(iframe_html_pulse, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_pulse.name)
+
+
+         # Save the map to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as temp_file_eda:
+        m_eda.save(temp_file_eda.name)
+
+        # Convert the HTML file to base64
+        with open(temp_file_eda.name, "rb") as f:
+            encoded_html_eda = base64.b64encode(f.read()).decode("utf-8")
+
+        # Create an embeddable HTML string
+        iframe_html_eda = f"""
+        <iframe src="data:text/html;base64,{encoded_html_eda}" width="100%" height="600px" style="border:none;"></iframe>
+        """
+
+        # Add to Datapane components
+        title_eda = dp.Text(f"### GPS Trajectory and EDA - {date.strftime('%Y-%m-%d')}")
+
+        datapane_html_maps4.append(title_eda)
+        datapane_html_maps4.append(dp.HTML(iframe_html_eda, label=f"Map for {date}"))
+
+    # Clean up the temporary file
+    os.remove(temp_file_eda.name)
+
+
+# **Create a Datapane Report**
+report4 = dp.Report(
+    dp.Text("# GPS Trajectory Maps with Biometrics Coloring - DHL Copilot"),
+    dp.Text("## Daily Maps Overview"),
+    *datapane_html_maps4  # Unpack list of HTML-embedded maps
+)
+
+# Save or upload the Datapane report
+report4.save("gps_biometrics_dashboard_DHL_copilot.html")  # Save locally
+# report.upload(name="GPS Temperature Dashboard")  # Upload to Datapane (if needed)
+
+print("Dashboard created successfully! Open 'gps_biometrics_dashboard_DHL_copilot.html' to view it.")
+
+#**TEST ANALYSIS**
+
+all_data4.info()
+
+# Define the start and end date for treatment
+treatment_start_hills = "2024-12-10"
+treatment_end_hills = "2024-12-13"
+
+treatment_start_dhl = "2024-12-17"
+treatment_end_dhl = "2024-12-28"
+
+# Convert to datetime
+treatment_start_hills = pd.to_datetime(treatment_start_hills)
+treatment_end_hills = pd.to_datetime(treatment_end_hills)
+
+treatment_start_dhl = pd.to_datetime(treatment_start_dhl)
+treatment_end_dhl = pd.to_datetime(treatment_end_dhl)
+
+# Assign treatment label based on date range
+# Assign treatment label based on date range
+all_data["treatment"] = all_data["Date"].apply(lambda x: "Yes" if treatment_start_hills.date() <= x <= treatment_end_hills.date() else "No")
+all_data2["treatment"] = all_data2["Date"].apply(lambda x: "Yes" if treatment_start_hills.date() <= x <= treatment_end_hills.date() else "No")
+all_data3["treatment"] = all_data3["Date"].apply(lambda x: "Yes" if treatment_start_dhl.date() <= x <= treatment_end_dhl.date() else "No")
+all_data4["treatment"] = all_data4["Date"].apply(lambda x: "Yes" if treatment_start_dhl.date() <= x <= treatment_end_dhl.date() else "No")
+
+
+
+!pip install --upgrade pandas
+
+import seaborn as sns
+
+all_data['Date'] = pd.to_datetime(all_data['Date']).dt.date
+all_data2['Date'] = pd.to_datetime(all_data2['Date']).dt.date
+all_data3['Date'] = pd.to_datetime(all_data3['Date']).dt.date
+all_data4['Date'] = pd.to_datetime(all_data4['Date']).dt.date
+
+plt.figure(figsize=(8, 5))
+sns.boxplot(x="treatment", y="Stress_Score", data=all_data)
+plt.title("Stress Levels Before and After Treatment")
+plt.show()
+
+all_data["participant_id"] = "Driver1"
+all_data2["participant_id"] = "Copilot1"
+all_data3["participant_id"] = "Driver2"
+all_data4["participant_id"] = "Copilot2"
+
+# Merge all dataframes into a single one
+df_all = pd.concat([all_data, all_data2, all_data3, all_data4], ignore_index=True)
+
+# Convert 'date' to datetime if not already
+df_all["date"] = pd.to_datetime(df_all["date"])
+
+# -------------------------------
+# **Boxplot for All Participants**
+# -------------------------------
+plt.figure(figsize=(10, 6))
+sns.boxplot(x="participant_id", y="Stress_Score", hue="treatment", data=df_all)
+
+plt.title("Stress Levels Before and After Treatment (Grouped by Participant)")
+plt.xlabel("Participant")
+plt.ylabel("Stress Level")
+plt.legend(title="VLB")
+plt.show()
+
+
+lat_min, lat_max = 51.500001, 51.508682
+lon_min, lon_max = -0.100250, -0.077956
+
+# Filter the dataframe to only include points within the specified area
+df_filtered = df_all[
+    (df_all["Latitude"] >= lat_min) & (df_all["Latitude"] <= lat_max) &
+    (df_all["Longitude"] >= lon_min) & (df_all["Longitude"] <= lon_max)
+    #& (df_all["participant_id"]=='Driver1')
+]
+
+
+# Check if filtering removed all data
+if df_filtered.empty:
+    print("No data points fall within the specified geographic area.")
+else:
+    # Adjust the boxplot to group by participant first
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x="participant_id", y="Stress_Score", hue="treatment", data=df_filtered)
+
+    plt.title("Stress Levels Before and After Treatment (Filtered by Geographic Area)")
+    plt.xlabel("Participant")
+    plt.ylabel("Stress Level")
+    plt.legend(title="Treatment")
+    plt.show()
+
+
+df_all['treatment'].value_counts()
+
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+df_filtered['date'] = df_filtered['date'].astype(str)  # Convert day ID to string
+df_filtered['participant_id'] = df_filtered['participant_id'].astype(str)  # Convert participant ID to string if needed
+df_filtered['treatment'] = df_filtered['treatment'].map({'Yes': 1, 'No': 0})
+
+# Fit a linear mixed-effects model
+model = smf.mixedlm("Stress_Score ~ treatment",
+                     df_filtered,
+                     groups=df_filtered["participant_id"],  # Random effect for participant
+                     re_formula="1")  # Random intercept model
+
+# Fit the model
+result = model.fit(method='powell')
+
+# Print the summary
+print(result.summary())
+
+
+# Fit a linear mixed-effects model
+model = smf.mixedlm("Stress_Score ~ treatment",
+                     df_filtered,
+                     groups=df_filtered["participant_id"],  # Random effect for participant
+                     re_formula="1")  # Random intercept model
+
+# Fit the model
+result = model.fit(method='powell')
+
+# Print the summary
+print(result.summary())
+
+
+
+# Apply log transformation (adding 1 to avoid log(0))
+df_filtered['Stress_Score_log'] = np.log1p(df_filtered['Stress_Score'])
+
+# Refit the mixed model using log-transformed stress scores
+model_log = smf.mixedlm("Stress_Score_log ~ treatment",
+                         df_filtered,
+                         groups=df_filtered["participant_id"],
+                         re_formula="1")
+
+result_log = model_log.fit(method='powell')
+
+# Print the summary of the transformed model
+print(result_log.summary())
+
+
+
+# Get fitted values and residuals from the mixed model
+df_filtered['fitted_values'] = result.fittedvalues
+df_filtered['residuals'] = df_filtered['Stress_Score'] - df_filtered['fitted_values']
+
+# Plot fitted values vs. residuals
+plt.figure(figsize=(8, 5))
+sns.scatterplot(x=df_filtered['fitted_values'], y=df_filtered['residuals'])
+plt.axhline(0, color='red', linestyle='--')
+plt.xlabel("Fitted Values")
+plt.ylabel("Residuals")
+plt.title("Residuals vs. Fitted Values (Linearity Check)")
+plt.show()
+
+
+from scipy.stats import shapiro
+
+# Histogram of residuals
+plt.figure(figsize=(8, 5))
+sns.histplot(df_filtered['residuals'], kde=True, bins=30)
+plt.title("Histogram of Residuals (Normality Check)")
+plt.xlabel("Residuals")
+plt.ylabel("Frequency")
+plt.show()
+
+# Q-Q plot for residuals
+sm.qqplot(df_filtered['residuals'], line='s')
+plt.title("Q-Q Plot of Residuals")
+plt.show()
+
+# Shapiro-Wilk test for normality
+shapiro_test = shapiro(df_filtered['residuals'])
+print(f"Shapiro-Wilk Test: W={shapiro_test.statistic:.4f}, p={shapiro_test.pvalue:.4f}")
+
+
+# Residuals vs. Fitted Values Plot
+plt.figure(figsize=(8, 5))
+sns.scatterplot(x=df_filtered['fitted_values'], y=abs(df_filtered['residuals']))
+plt.axhline(y=0, color='red', linestyle='--')
+plt.xlabel("Fitted Values")
+plt.ylabel("Absolute Residuals")
+plt.title("Residuals vs. Fitted Values (Homoscedasticity Check)")
+plt.show()
+
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import statsmodels.api as sm
+
+# Get fitted values and residuals from the mixed model
+df_filtered['fitted_values'] = result.fittedvalues
+df_filtered['residuals'] = df_filtered['Stress_Score'] - df_filtered['fitted_values']
+
+# Plot fitted values vs. residuals
+plt.figure(figsize=(8, 5))
+sns.scatterplot(x=df_filtered['fitted_values'], y=df_filtered['residuals'])
+plt.axhline(0, color='red', linestyle='--')
+plt.xlabel("Fitted Values")
+plt.ylabel("Residuals")
+plt.title("Residuals vs. Fitted Values (Linearity Check)")
+plt.show()
+
+
+df_filtered.info()
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+df_all['date'] = df_all['date'].astype(str)  # Convert day ID to string
+df_all['participant_id'] = df_all['participant_id'].astype(str)  # Convert participant ID to string if needed
+df_all['treatment'] = df_all['treatment'].map({'Yes': 1, 'No': 0})
+
+# Fit a linear mixed-effects model
+model = smf.ols("Stress_Score ~ treatment",
+                     data=df_all).fit()  # Random intercept model
+
+# Print the summary
+print(model.summary())
+
+
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+df_filtered['date'] = df_filtered['date'].astype(str)  # Convert day ID to string
+df_filtered['participant_id'] = df_filtered['participant_id'].astype(str)  # Convert participant ID to string if needed
+df_filtered['treatment'] = df_filtered['treatment'].map({'Yes': 1, 'No': 0})
+
+# Fit a linear mixed-effects model
+model2 = smf.ols("Stress_Score ~ treatment",
+                     data=df_filtered).fit()  # Random intercept model
+
+
+# Print the summary
+print(model2.summary())
+
+# Fit a linear mixed-effects model
+model2 = smf.ols("Stress_Score ~ treatment",
+                     data=df_filtered).fit()  # Random intercept model
+
+
+# Print the summary
+print(model2.summary())
